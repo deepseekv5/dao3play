@@ -1,5 +1,6 @@
 // renderer.js — Three.js 场景：分块面剔除网格 + 图集材质 + 发光层 + 相机 + 拾取。
 import * as THREE from "../vendor/three/three.module.js";
+import { nightFromElev } from "./sun.js";
 import { OrbitControls } from "../vendor/three/OrbitControls.js";
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : +v || 0);
@@ -213,6 +214,7 @@ const ROT_FACE = [0, 1, 2, 3].map((t) => {
   return m;
 });
 
+
 export class VoxelRenderer {
   constructor(canvas, atlas) {
     this.atlas = atlas;
@@ -254,6 +256,11 @@ export class VoxelRenderer {
     // map 在图集加载完成后由 main.js 赋值为共享的 atlas.texture
     this.opaqueMat = new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0.0 });
     this.transparentMat = new THREE.MeshStandardMaterial({ transparent: true, opacity: 0.6, roughness: 0.5, metalness: 0.0, depthWrite: false });
+    // 水面单独一条材质：程序化地形的海/湖要靠它才读得出"是水"。
+    // 与通用透明方块共用 transparentMat 时，水只是"淡了一档的贴图"，
+    // 实测整片群岛看着像毛玻璃平台。这里压暗底色 + 降粗糙度，让水面吃高光。
+    // 只认 water：图集里 11 个 fluid 有 10 个是牛奶/果汁/酱油，统一染蓝就错了。
+    this.waterMat = new THREE.MeshStandardMaterial({ color: 0x8fd0ff, transparent: true, opacity: 0.78, roughness: 0.12, metalness: 0.05, depthWrite: false });
     this.glowMat = new THREE.MeshBasicMaterial({ transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
     // 空气墙材质：编辑器半透明绿罩（运行时整层隐藏，见 setBarriersVisible）
     this.barrierMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.28, color: 0x6fdc7f, depthWrite: false });
@@ -282,21 +289,52 @@ export class VoxelRenderer {
       uniforms: {
         top: { value: new THREE.Color(0x2f6fb0) }, bot: { value: new THREE.Color(0xbfe0ff) },
         sunDir: { value: new THREE.Vector3(0.4, 0.6, 0.3) }, sunCol: { value: new THREE.Color(0xfff2cc) },
-        night: { value: 0.0 },
+        night: { value: 0.0 }, uTime: { value: 0 },
       },
       vertexShader: "varying vec3 vP; void main(){ vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}",
       fragmentShader: `
-        uniform vec3 top; uniform vec3 bot; uniform vec3 sunDir; uniform vec3 sunCol; uniform float night;
+        uniform vec3 top; uniform vec3 bot; uniform vec3 sunDir; uniform vec3 sunCol;
+        uniform float night; uniform float uTime;
         varying vec3 vP;
+        float h31(vec3 p){ return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
         void main(){
           vec3 d = normalize(vP);
           float h = clamp(d.y*0.5+0.5, 0.0, 1.0);
+          vec3 sd3 = normalize(sunDir);
           vec3 sky = mix(bot, top, pow(h, 0.55));
-          float sd = max(dot(d, normalize(sunDir)), 0.0);
-          sky += sunCol * pow(sd, 220.0) * 1.2;          // 太阳圆盘
-          sky += sunCol * pow(sd, 6.0) * 0.18;           // 日晕
-          vec3 nightTop = vec3(0.03,0.05,0.12), nightBot = vec3(0.08,0.10,0.18);
+          float sd = max(dot(d, sd3), 0.0);
+          // 太阳只在天顶以上才画圆盘；落到地平线以下就该消失，而不是从脚下透出来
+          float sunUp = smoothstep(-0.03, 0.05, sd3.y);
+          sky += sunCol * pow(sd, 220.0) * 1.2 * sunUp;   // 太阳圆盘
+          sky += sunCol * pow(sd, 6.0) * 0.18 * sunUp;    // 日晕
+          // 晨昏带：太阳贴着地平线那一段，天底烧出一条暖色。没有它日出日落就是"啪"地切换
+          float twilight = exp(-abs(sd3.y) * 7.0) * smoothstep(0.85, 0.0, night);
+          float az = pow(max(dot(d, normalize(vec3(sd3.x, 0.0, sd3.z) + 1e-5)), 0.0), 3.0);
+          sky += vec3(0.95, 0.42, 0.16) * twilight * az * smoothstep(0.62, 0.0, h) * 0.85;
+          vec3 nightTop = vec3(0.02,0.035,0.09), nightBot = vec3(0.06,0.08,0.15);
           vec3 nsky = mix(nightBot, nightTop, pow(h,0.5));
+          // 星空：方向量化成格子，每格按哈希决定有没有星、多亮、闪多快。
+          // 只在天顶半球出现（贴地平线的星是雾里看花），并随 night 淡入。
+          // 格子密度与星点半径是配出来的：150 格/半径 0.16 时星点只有 0.06°，
+          // 在 1280px 画布上不足一个像素，实测整片夜空一颗星都看不见。
+          // 70 格 + 半径 0.22 格 ≈ 0.18°，约 3~4px，才是肉眼读得到的星。
+          vec3 q = d * 70.0;
+          vec3 cell = floor(q);
+          vec3 rr = fract(q);
+          float present = step(0.94, h31(cell));
+          vec3 off = vec3(h31(cell + 1.7), h31(cell + 3.3), h31(cell + 5.1));
+          float dd = length(rr - off);
+          float mag = h31(cell + 9.2);
+          float twk = 0.72 + 0.28 * sin(uTime * (0.7 + mag * 2.2) + mag * 40.0);
+          float star = present * smoothstep(0.22, 0.0, dd) * (0.35 + mag * 0.65) * twk;
+          star *= smoothstep(0.02, 0.28, d.y) * night;
+          nsky += vec3(0.88, 0.92, 1.0) * star * 2.4;
+          // 月亮在太阳的反方向，夜里才看得见
+          vec3 md = normalize(-sd3 + 1e-5);
+          float mup = smoothstep(-0.02, 0.08, md.y) * night;
+          float mdd = dot(d, md);
+          nsky += vec3(0.92, 0.94, 1.0) * smoothstep(0.99965, 0.99990, mdd) * 2.2 * mup;  // 月盘
+          nsky += vec3(0.55, 0.62, 0.80) * pow(max(mdd, 0.0), 220.0) * 0.16 * mup;        // 月晕
           sky = mix(sky, nsky, night);
           gl_FragColor = vec4(sky, 1.0);
         }`,
@@ -376,6 +414,7 @@ vec2 fxTileRect(float t){
     };
     patch(this.opaqueMat);
     patch(this.transparentMat);
+    patch(this.waterMat);
     patch(this.glowMat);
     this.setEdges = (on) => { this.showEdges = !!on; this._edgeU.value = on ? 1 : 0; };
     this.showGrid = true;
@@ -618,15 +657,16 @@ vec2 fxTileRect(float t){
 
   buildChunk(cx, cy, cz, key) {
     const old = this.chunkMeshes.get(key);
-    if (old) { if (old.opaque) this.disposeMesh(old.opaque); if (old.trans) this.disposeMesh(old.trans); if (old.glow) this.disposeMesh(old.glow); if (old.barrier) this.disposeMesh(old.barrier); }
+    if (old) { if (old.opaque) this.disposeMesh(old.opaque); if (old.trans) this.disposeMesh(old.trans); if (old.water) this.disposeMesh(old.water); if (old.glow) this.disposeMesh(old.glow); if (old.barrier) this.disposeMesh(old.barrier); }
     const w = this.world; if (!w) { this.chunkMeshes.delete(key); return; }
     const A = this.atlas;
     const pos = [], nor = [], uv = [], idx = [], av = [];
     const tpos = [], tnor = [], tuv = [], tidx = [], tav = [];
+    const wpos = [], wnor = [], wuv = [], widx = [], wav = [];
     const gpos = [], gnor = [], guv = [], gidx = [], gav = [];
     const bpos = [], bnor = [], buv = [], bidx = [], bav = [];
     const ox = cx * CHUNK, oy = cy * CHUNK, oz = cz * CHUNK;
-    let vc = 0, tvc = 0, gvc = 0, bvc = 0;
+    let vc = 0, tvc = 0, wvc = 0, gvc = 0, bvc = 0;
     for (let y = 0; y < CHUNK; y++) for (let z = 0; z < CHUNK; z++) for (let x = 0; x < CHUNK; x++) {
       const wx = ox + x, wy = oy + y, wz = oz + z;
       const id = w.get(wx, wy, wz); if (!id) continue;
@@ -642,12 +682,14 @@ vec2 fxTileRect(float t){
       if (!Array.isArray(block.emissive)) {
         console.warn("[renderer] block missing emissive id=" + block.id + " name=" + block.name + " type=" + typeof block);
       }
-      // 空气墙进独立桶；其余按透明/不透明分桶
-      const useT = selfTrans && !isBarrier;
+      // 空气墙进独立桶；水单独一桶；其余按透明/不透明分桶
+      const isWater = selfTrans && !isBarrier && block.name === "water";
+      const useT = selfTrans && !isBarrier && !isWater;
+      const useW = isWater;
       const rot = w.getRot ? (w.getRot(wx, wy, wz) & 3) : 0;
       const fmap = rot ? ROT_FACE[rot] : null; // 旋转只换贴图来源，面的几何与剔除不变
-      const P = useT ? tpos : isBarrier ? bpos : pos, N = useT ? tnor : isBarrier ? bnor : nor, U = useT ? tuv : isBarrier ? buv : uv;
-      let base = useT ? tvc : isBarrier ? bvc : vc;
+      const P = useW ? wpos : useT ? tpos : isBarrier ? bpos : pos, N = useW ? wnor : useT ? tnor : isBarrier ? bnor : nor, U = useW ? wuv : useT ? tuv : isBarrier ? buv : uv;
+      let base = useW ? wvc : useT ? tvc : isBarrier ? bvc : vc;
       for (const f of FACES) {
         const nx = wx + f.dir[0], ny = wy + f.dir[1], nz = wz + f.dir[2];
         const nid = w.get(nx, ny, nz);
@@ -663,7 +705,7 @@ vec2 fxTileRect(float t){
         const a4 = an && an.frames && an.frames.length > 1
           ? [an.frames.length, (an.duration || 200) / 1000, an.frames[0], 0]
           : [0, 0, 0, 0];
-        const AV = useT ? tav : isBarrier ? bav : av;
+        const AV = useW ? wav : useT ? tav : isBarrier ? bav : av;
         for (let c = 0; c < 4; c++) {
           const co = f.corners[c];
           P.push(wx + co[0], wy + co[1], wz + co[2]);
@@ -672,9 +714,9 @@ vec2 fxTileRect(float t){
           U.push(u0 + su * (u1 - u0), v0 + sv * (v1 - v0));
           AV.push(a4[0], a4[1], a4[2], a4[3]);
         }
-        (useT ? tidx : isBarrier ? bidx : idx).push(base, base + 1, base + 2, base, base + 2, base + 3);
+        (useW ? widx : useT ? tidx : isBarrier ? bidx : idx).push(base, base + 1, base + 2, base, base + 2, base + 3);
         base += 4;
-        if (useT) tvc += 4; else if (isBarrier) bvc += 4; else vc += 4;
+        if (useW) wvc += 4; else if (useT) tvc += 4; else if (isBarrier) bvc += 4; else vc += 4;
         if (isGlow) {
           for (let c = 0; c < 4; c++) {
             const co = f.corners[c];
@@ -703,6 +745,7 @@ vec2 fxTileRect(float t){
     };
     rec.opaque = build(pos, nor, uv, idx, this.opaqueMat, true, av);
     rec.trans = build(tpos, tnor, tuv, tidx, this.transparentMat, false, tav);
+    rec.water = build(wpos, wnor, wuv, widx, this.waterMat, false, wav);
     rec.glow = build(gpos, gnor, guv, gidx, this.glowMat, false, gav);
     // 空气墙：半透明网格（编辑器里看得到、可拾取），运行时整体隐藏；不投影避免暴露位置
     if (!bpos.length && !bvc) rec.barrier = null;
@@ -720,6 +763,7 @@ vec2 fxTileRect(float t){
     }
     if (rec.glow) rec.glow.renderOrder = 3;
     if (rec.trans) rec.trans.renderOrder = 2;
+    if (rec.water) rec.water.renderOrder = 2;
     this.chunkMeshes.set(key, rec);
   }
   // 空气墙可见性（运行模式隐藏）
@@ -785,6 +829,7 @@ vec2 fxTileRect(float t){
     const meshes = [];
     for (const m of this.chunkMeshes.values()) if (m.opaque) meshes.push(m.opaque);
     for (const m of this.chunkMeshes.values()) if (m.trans) meshes.push(m.trans);
+    for (const m of this.chunkMeshes.values()) if (m.water) meshes.push(m.water);
     for (const m of this.chunkMeshes.values()) if (m.barrier) meshes.push(m.barrier);
     const hits = this.raycaster.intersectObjects(meshes, false);
     if (hits.length) {
@@ -851,7 +896,9 @@ vec2 fxTileRect(float t){
       this.sun.target.position.copy(this.controls.target);
       this.fill.position.copy(this.controls.target).add(d.clone().multiplyScalar(-dist));
       const elev = d.y;
-      const night = THREE.MathUtils.clamp((0.12 - elev) / 0.24, 0, 1);
+      // 运行时会把它自己算好的 night 传进来（官方六面天光与雾色就是按那个值调的），
+      // 那种情况下必须用同一个值，否则"天空的夜"和"灯光的夜"会各说各话。
+      const night = t.night == null ? nightFromElev(elev) : THREE.MathUtils.clamp(+t.night, 0, 1);
       u.night.value = night;
       this.sun.intensity = (t.sunIntensity ?? 2.4) * (1 - night * 0.85);
       this.hemi.intensity = (t.hemi ?? 0.65) * (1 - night * 0.6);
@@ -892,7 +939,11 @@ vec2 fxTileRect(float t){
     if (t.shadows != null) { this.sun.castShadow = t.shadows; this.renderer.shadowMap.enabled = t.shadows; }
     if (t.grid != null) { this.showGrid = t.grid; this.grid.visible = t.grid; this.baseplate.visible = t.grid; }
     if (t.glow != null) { this.glowMat.opacity = t.glow; }
-    if (t.exposure != null) this.renderer.toneMappingExposure = t.exposure;
+    // 曝光：夜里在用户设定值上再抬一档。ACES 会把暗部压得更狠，
+    // 不补偿的话子夜场景里玩家根本看不清脚下的路。
+    if (t.exposure != null) this._exposureBase = +t.exposure;
+    const base = this._exposureBase == null ? 1.12 : this._exposureBase;
+    this.renderer.toneMappingExposure = base * (1 + u.night.value * 0.42);
   }
   _groundFromSky(skyHex) { const c = new THREE.Color(skyHex); const g = c.clone().multiplyScalar(0.45); g.offsetHSL(0, -0.1, -0.15); return g.getHex(); }
   // 官方 world.rendering3d=false：暂停提交新帧，画面停在最后一帧（不是藏起画布）
@@ -921,6 +972,7 @@ vec2 fxTileRect(float t){
       prev = now;
       this.resize();
       this._anim.uTime.value = now / 1000;
+      this.skyMat.uniforms.uTime.value = now / 1000;   // 星星闪烁
       if (this.fpMode) this.fpControls.update(delta);
       else this.controls.update();
       this.updateWeather(delta);
